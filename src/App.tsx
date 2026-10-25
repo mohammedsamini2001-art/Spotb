@@ -32,7 +32,11 @@ type PaperIdea = {
 }
 
 const API = 'https://data-api.binance.vision/api/v3'
-const QUOTES = ['USDT', 'USDC', 'BTC', 'ETH', 'BNB']
+const QUOTES = ['USDT', 'USDC']
+const SYMBOLS_BY_QUOTE: Record<string, string[]> = {
+  USDT: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'TRXUSDT'],
+  USDC: ['BTCUSDC', 'ETHUSDC', 'BNBUSDC', 'SOLUSDC', 'XRPUSDC', 'ADAUSDC', 'DOGEUSDC', 'LINKUSDC'],
+}
 const money = (n: number, digits = 6) =>
   Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: digits }) : '—'
 const percent = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
@@ -138,9 +142,12 @@ function App() {
     setLoading(true)
     setError('')
     try {
+      const candidates = SYMBOLS_BY_QUOTE[quote] ?? []
+      if (!candidates.length) throw new Error(`No configured market shortlist for ${quote}.`)
+      const symbolsParam = encodeURIComponent(JSON.stringify(candidates))
       const [info, allTickers] = await Promise.all([
-        getJson<{ symbols: { symbol: string; status: string; quoteAsset: string; isSpotTradingAllowed?: boolean }[] }>('/exchangeInfo'),
-        getJson<Ticker[]>('/ticker/24hr'),
+        getJson<{ symbols: { symbol: string; status: string; quoteAsset: string; isSpotTradingAllowed?: boolean }[] }>(`/exchangeInfo?symbols=${symbolsParam}`),
+        getJson<Ticker[]>(`/ticker/24hr?symbols=${symbolsParam}`),
       ])
       const allowed = new Set(
         info.symbols
@@ -150,7 +157,6 @@ function App() {
       const selected = allTickers
         .filter((t) => allowed.has(t.symbol) && Number(t.lastPrice) > 0)
         .sort((a, b) => Number(b.quoteVolume) - Number(a.quoteVolume))
-        .slice(0, 12)
       setTickers(selected)
       setLastUpdated(new Date().toLocaleTimeString())
       if (!selected.length) setError(`No eligible ${quote} spot markets were returned.`)
@@ -175,9 +181,18 @@ function App() {
         .filter((r): r is PromiseFulfilledResult<Signal> => r.status === 'fulfilled')
         .map((r) => r.value)
         .sort((a, b) => b.score - a.score)
+      const failures = results.flatMap((r, i) =>
+        r.status === 'rejected'
+          ? [`${shortlist[i].symbol}: ${r.reason instanceof Error ? r.reason.message : 'request failed'}`]
+          : [],
+      )
       setSignals(valid)
-      if (!valid.length) setError('No analysis completed. Binance may be rate-limiting requests; try again shortly.')
-      else setLastUpdated(new Date().toLocaleTimeString())
+      if (!valid.length) {
+        setError(`No analysis completed. ${failures.slice(0, 3).join(' | ') || 'Check your connection and retry.'}`)
+      } else {
+        setLastUpdated(new Date().toLocaleTimeString())
+        if (failures.length) setError(`Analysed ${valid.length}/${shortlist.length} markets. Failed: ${failures.slice(0, 2).join(' | ')}`)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Scan failed.')
     } finally {
