@@ -29,6 +29,10 @@ type PaperIdea = {
   stop: number
   target: number
   time: string
+  quote: string
+  stake: number
+  feePct: number
+  slippagePct: number
 }
 
 const API = 'https://data-api.binance.vision/api/v3'
@@ -40,6 +44,21 @@ const SYMBOLS_BY_QUOTE: Record<string, string[]> = {
 const money = (n: number, digits = 6) =>
   Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: digits }) : '—'
 const percent = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+
+function estimateNet(
+  idea: PaperIdea,
+  exitPrice: number,
+): number {
+  const stake = Number.isFinite(idea.stake) ? idea.stake : 25
+  const feePct = Number.isFinite(idea.feePct) ? idea.feePct : 0.1
+  const slippagePct = Number.isFinite(idea.slippagePct) ? idea.slippagePct : 0.05
+  if (idea.entry <= 0 || exitPrice <= 0 || stake <= 0) return NaN
+
+  const exitValue = (stake / idea.entry) * exitPrice
+  const gross = exitValue - stake
+  const estimatedCosts = (stake + exitValue) * (feePct + slippagePct) / 100
+  return gross - estimatedCosts
+}
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API}${path}`)
@@ -131,7 +150,19 @@ function App() {
   const [quote, setQuote] = useState('USDT')
   const [tickers, setTickers] = useState<Ticker[]>([])
   const [signals, setSignals] = useState<Signal[]>([])
-  const [ideas, setIdeas] = useState<PaperIdea[]>([])
+  const [stakeInput, setStakeInput] = useState('25')
+  const [feeInput, setFeeInput] = useState('0.1')
+  const [slippageInput, setSlippageInput] = useState('0.05')
+  const [ideas, setIdeas] = useState<PaperIdea[]>(() => {
+    try {
+      const saved = window.localStorage.getItem('spotb-paper-ideas-v1')
+      if (!saved) return []
+      const parsed: unknown = JSON.parse(saved)
+      return Array.isArray(parsed) ? parsed as PaperIdea[] : []
+    } catch {
+      return []
+    }
+  })
   const [loading, setLoading] = useState(false)
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
@@ -201,8 +232,31 @@ function App() {
   }, [tickers, loadMarkets])
 
   useEffect(() => { void loadMarkets() }, [loadMarkets])
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('spotb-paper-ideas-v1', JSON.stringify(ideas))
+    } catch {
+      // Keep the in-memory journal usable if browser storage is unavailable.
+    }
+  }, [ideas])
+
 
   function addPaperIdea(signal: Signal) {
+    const stake = Number(stakeInput)
+    const feePct = Number(feeInput)
+    const slippagePct = Number(slippageInput)
+
+    if (
+      !Number.isFinite(stake) || stake <= 0 ||
+      !Number.isFinite(feePct) || feePct < 0 || feePct > 5 ||
+      !Number.isFinite(slippagePct) || slippagePct < 0 || slippagePct > 5
+    ) {
+      setError('Set a positive stake and fee/slippage values between 0% and 5%.')
+      setTab('paper')
+      return
+    }
+
+    setError('')
     setIdeas((current) => [{
       id: Date.now(),
       symbol: signal.symbol,
@@ -210,6 +264,10 @@ function App() {
       stop: signal.stop,
       target: signal.target,
       time: new Date().toLocaleString(),
+      quote: signal.symbol.endsWith('USDC') ? 'USDC' : 'USDT',
+      stake,
+      feePct,
+      slippagePct,
     }, ...current])
     setTab('paper')
   }
@@ -307,19 +365,49 @@ function App() {
         </section>
       ) : (
         <section className="panel">
-          <div className="panel-heading"><div><p className="eyebrow">SIMULATED ONLY</p><h2>Paper ideas</h2><p className="muted">Saved entry, stop and target notes; no orders are sent to Binance.</p></div></div>
+          <div className="panel-heading"><div><p className="eyebrow">SIMULATED ONLY</p><h2>Paper ideas</h2><p className="muted">Saved estimates only; no orders are sent to Binance.</p></div></div>
+
+          <div className="controls paper-settings">
+            <label className="select-label">Stake per idea (USDT/USDC)
+              <input type="number" min="0.01" step="any" value={stakeInput} onChange={(e) => setStakeInput(e.target.value)} />
+            </label>
+            <label className="select-label">Fee per side (%)
+              <input type="number" min="0" max="5" step="0.01" value={feeInput} onChange={(e) => setFeeInput(e.target.value)} />
+            </label>
+            <label className="select-label">Slippage per side (%)
+              <input type="number" min="0" max="5" step="0.01" value={slippageInput} onChange={(e) => setSlippageInput(e.target.value)} />
+            </label>
+          </div>
+          <p className="muted">These settings apply to newly logged ideas. Each idea keeps its own assumptions. Stake is in the market's quote asset, not KES.</p>
+
           {ideas.length === 0 ? <div className="empty-state"><span>◇</span><h3>No paper ideas yet</h3><p>Run a scan and log an idea only when a setup meets the technical rules.</p></div> : (
-            <div className="table-wrap"><table><thead><tr><th>Market</th><th>Entry reference</th><th>Stop reference</th><th>Target reference</th><th>Logged</th></tr></thead><tbody>
-              {ideas.map((i) => <tr key={i.id}><td><strong>{i.symbol}</strong></td><td>{money(i.entry, 8)}</td><td>{money(i.stop, 8)}</td><td>{money(i.target, 8)}</td><td>{i.time}</td></tr>)}
+            <div className="table-wrap"><table><thead><tr><th>Market</th><th>Stake</th><th>Entry</th><th>Stop</th><th>Net at stop*</th><th>Target</th><th>Net at target*</th><th>Assumptions</th><th>Logged</th></tr></thead><tbody>
+              {ideas.map((i) => {
+                const quoteAsset = i.quote || (i.symbol.endsWith('USDC') ? 'USDC' : 'USDT')
+                const stopNet = estimateNet(i, i.stop)
+                const targetNet = estimateNet(i, i.target)
+                return <tr key={i.id}>
+                  <td><strong>{i.symbol}</strong></td>
+                  <td>{money(Number.isFinite(i.stake) ? i.stake : 25, 4)} {quoteAsset}</td>
+                  <td>{money(i.entry, 8)}</td>
+                  <td>{money(i.stop, 8)}</td>
+                  <td className={stopNet >= 0 ? 'positive' : 'negative'}>{money(stopNet, 4)} {quoteAsset}</td>
+                  <td>{money(i.target, 8)}</td>
+                  <td className={targetNet >= 0 ? 'positive' : 'negative'}>{money(targetNet, 4)} {quoteAsset}</td>
+                  <td>{Number.isFinite(i.feePct) ? i.feePct : 0.1}% fee / {Number.isFinite(i.slippagePct) ? i.slippagePct : 0.05}% slip per side</td>
+                  <td>{i.time}</td>
+                </tr>
+              })}
             </tbody></table></div>
           )}
+          <p className="muted">*Approximate net scenarios subtract estimated entry/exit fees and slippage. They exclude spread, taxes, partial fills and other costs. Actual results can differ; the stop or target is not guaranteed to fill.</p>
         </section>
       )}
 
       <section className="notice-grid">
         <article><span className="notice-icon">⌁</span><div><h3>Spot only</h3><p>No margin, leverage, futures, shorting, or interest products.</p></div></article>
         <article><span className="notice-icon">◈</span><div><h3>Shariah screening</h3><p>Token permissibility is not verified by this prototype. Research the asset and seek qualified guidance.</p></div></article>
-        <article><span className="notice-icon">◎</span><div><h3>Risk first</h3><p>Stops and targets are estimates from recent volatility. Fees, slippage and currency conversion are not yet included.</p></div></article>
+        <article><span className="notice-icon">◎</span><div><h3>Risk first</h3><p>Paper journal scenarios estimate fees and slippage from your settings. Currency conversion, spread, taxes and actual fills are not included.</p></div></article>
       </section>
       <footer><span>SPOTB · EARLY PAPER PROTOTYPE</span><span>Market data via Binance public API · Not financial advice</span></footer>
     </main>
