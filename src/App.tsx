@@ -7,7 +7,7 @@ type Ticker = {
   priceChangePercent: string
   quoteVolume: string
 }
-type Candle = { close: number; high: number; low: number; volume: number }
+type Candle = { close: number; high: number; low: number; volume: number; closeTime: number }
 type Signal = {
   symbol: string
   price: number
@@ -82,20 +82,34 @@ function rsi(values: number[], period = 14): number {
     if (diff > 0) gain += diff
     else loss -= diff
   }
-  if (loss === 0) return 100
+  if (loss === 0) return gain === 0 ? 50 : 100
   return 100 - 100 / (1 + gain / loss)
 }
 
 async function candles(symbol: string, interval: string): Promise<Candle[]> {
-  const raw = await getJson<unknown[][]>(
-    `/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=220`,
-  )
-  return raw.map((row) => ({
-    high: Number(row[2]),
-    low: Number(row[3]),
-    close: Number(row[4]),
-    volume: Number(row[5]),
-  }))
+  const raw = await getJson<unknown[][]>(`/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=220`)
+  return raw
+    .filter((row) =>
+      Array.isArray(row) && row.length >= 7 &&
+      [row[2], row[3], row[4], row[5], row[6]].every(
+        (value) => value !== null && value !== undefined && value !== '',
+      )
+    )
+    .map((row) => ({
+      high: Number(row[2]),
+      low: Number(row[3]),
+      close: Number(row[4]),
+      volume: Number(row[5]),
+      closeTime: Number(row[6]),
+    }))
+    .filter((candle) =>
+      Number.isFinite(candle.high) &&
+      Number.isFinite(candle.low) &&
+      Number.isFinite(candle.close) &&
+      Number.isFinite(candle.volume) &&
+      Number.isFinite(candle.closeTime) &&
+      candle.closeTime < Date.now()
+    )
 }
 
 async function analyze(ticker: Ticker): Promise<Signal> {
@@ -105,7 +119,15 @@ async function analyze(ticker: Ticker): Promise<Signal> {
   ])
   const closes = fast.map((c) => c.close)
   const slowCloses = slow.map((c) => c.close)
-  const price = closes.at(-1) ?? Number(ticker.lastPrice)
+  const price = Number(ticker.lastPrice)
+  const enoughCandles = fast.length >= 200 && slow.length >= 50
+  const validCandles = [...fast, ...slow].every((c) =>
+    Number.isFinite(c.close) && c.close > 0 &&
+    Number.isFinite(c.high) && Number.isFinite(c.low) &&
+    Number.isFinite(c.volume) && c.volume >= 0 &&
+    c.high >= c.low &&
+    c.close >= c.low && c.close <= c.high
+  )
   const ema20 = ema(closes, 20)
   const ema50 = ema(closes, 50)
   const ema200 = ema(closes, 200)
@@ -129,14 +151,32 @@ async function analyze(ticker: Ticker): Promise<Signal> {
   if (averageVolume > 0 && latestVolume > averageVolume * 1.2) reasons.push('Volume above average')
 
   const score = reasons.length
-  const confirmed = score >= 4 && price > ema20 && Number.isFinite(atr) && atr > 0
+  const indicatorsValid =
+    Number.isFinite(price) && price > 0 &&
+    Number.isFinite(ema20) && Number.isFinite(ema50) &&
+    Number.isFinite(ema200) && Number.isFinite(hourly20) &&
+    Number.isFinite(hourly50) && Number.isFinite(strength) &&
+    Number.isFinite(resistance) && Number.isFinite(averageVolume) &&
+    Number.isFinite(atr) && atr > 0
+  const dataValid = enoughCandles && validCandles && indicatorsValid
+  const confirmed =
+    dataValid &&
+    ema20 > ema50 && ema50 > ema200 &&
+    hourly20 > hourly50 &&
+    strength >= 50 && strength <= 68 &&
+    closes.at(-1)! > resistance &&
+    score >= 4 && price > ema20
   return {
     symbol: ticker.symbol,
     price,
     change: Number(ticker.priceChangePercent),
     volume: Number(ticker.quoteVolume),
     score,
-    status: confirmed ? 'CONFIRMED SETUP' : score >= 2 ? 'WATCH' : 'NO TRADE',
+    status: confirmed
+      ? 'CONFIRMED SETUP'
+      : dataValid && score >= 2
+        ? 'WATCH'
+        : 'NO TRADE',
     rsi: strength,
     entry: price,
     stop: price - atr * 1.5,
